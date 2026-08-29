@@ -1,0 +1,93 @@
+# Pacific BioArchive 进度记录
+
+> 更新时间:2026-08-30
+
+## 一句话状态
+
+数据功能、SNS、视频 1 fps、完整前端、CloudFront 和 Google IdP 均已部署；query-by-file 的 `X-Filename` CORS 问题已修复并通过线上预检。当前重点是完整 smoke test、Google 交互验收和报告/多人贡献记录。
+
+## 已完成(均有云上/本地证据)
+
+### 1. AWS 栈 `pba` — UPDATE_COMPLETE ✅
+
+| 输出 | 值 |
+|---|---|
+| API | https://o5g9c7rcac.execute-api.us-east-1.amazonaws.com |
+| Cognito UserPool | us-east-1_FHAyKPNrs |
+| Client ID | 2irism5thu55d8rp9b7aal5n4k |
+| Web 前端 | https://df3cv9pa7eg7p.cloudfront.net |
+| 桶 | pba-uploads / thumbs / models / query / web(均 987040391588 后缀) |
+
+### 2. P0 修订全部落地 ✅
+
+- Cognito `CallbackURLs`(修复首轮部署回滚的根因)
+- `EphemeralStorage: 4096`(模型 470MB + 媒体/帧)
+- S3 触发器 `Filter: prefix uploads/`(query-by-file 隔离,rubric 2.2.3)
+- 独立 `QueryBucket` + 1 天生命周期(查询临时文件绝不入库、自动清理)
+- `ImageUri` 改为 digest 固定参数 `ProcessMediaImageUri`(同 tag 更新可被 CFN 感知)
+- `pipeline.py` pointer.json 改 `s3.get_object`(私有桶,原公网 URL 会 403)
+- `replicate.py` 补上真正的文件+缩略图 OSS 复制(原来只写 index.json,oss_url 全是死链)
+- OSS 设计变更:**桶 private + 签名 URL**(放弃原 public-read;签名 URL 往返按规范化 key 匹配)
+- API Gateway CORS `AllowHeaders` 加入 `x-filename`：修复浏览器 query-by-file 请求因预检被拦截而显示 `Failed to fetch`；线上 OPTIONS 已返回 `access-control-allow-headers: authorization,content-type,x-filename`（commit `fa260db`）
+
+### 3. 模型已上传 ✅(10:42–10:45)
+
+`s3://pba-models-987040391588/models/`:mdv5a.pt (280MB) · model.pt (211MB) · pointer.json
+
+### 4. ECR 镜像依赖修复+部署链路一致 ✅
+
+时间线(均为 08-27):
+- 固定 `megadetector==10.0.24`，不再回退到无 import namespace 的 5.0.4
+- 固定 `onnx==1.22.0`/`onnx2torch==1.5.15`/`protobuf==4.25.8`，只豁免 YOLOv5 对 protobuf 的过严元数据约束
+- 构建期关键 import 通过；真实 `model.pt` 反序列化成功，真实 `mdv5a.pt` 733 层模型加载成功
+- 修正 MegaDetector 10.x `load_and_run_detector_batch` 为全关键字参数调用
+- 视频修复后最终 ECR digest `sha256:d96410a0f43c1f746142334487e97a8c82ccacd66ed2b713a37bb52941cdabae`
+- 10 帧只加载一次 MegaDetector；MegaDetector 与 SpeciesNet 分阶段驻留，分类结束后释放内存
+- 缩略图改用 Pillow，修复 Lambda 中 `cv2.imwrite` 参数兼容错误
+- Lambda 状态 `Active`/`Successful`，绑定 digest **= ECR latest digest** ✅
+
+> 说明:期间 `deploy-ecr.sh` 曾因隔离 DOCKER_CONFIG 导致 buildx 插件不可见而中止过一轮;
+> 修复(仅 login/push 用隔离配置,buildx 构建用原配置)已写入脚本,**且修复后的推送已在上面时间线中成功完成**。
+
+### 5. 阿里云与数据维护云验证 ✅
+
+- FC3 `pba-query`: `https://pba-query-iseukvgnef.cn-hangzhou.fcapp.run`
+- private `pba-oss-copy`: ACL 已确认为 `private`
+- 无 token=401，坏 token=401，CORS OPTIONS=204
+- ProcessMedia maintenance `rebuild_index`=200；上传后 OSS `index.json` 含 1 条正确媒体记录
+- 批量标签后刷新索引、跨云删除、SNS FilterPolicy 已实现并部署
+- 单图端到端：AWS/OSS 原图+缩略图、index、有效-token 按标签查询、签名 URL、缩略图反查均实测通过
+- 可删除样本 `Canis_familiaris_3.JPG`：去重=409 且 S3 仍 1 对象；标签增/删/ignored 与 DDB/index/阿里云一致；query-by-file 完成后 Files 表仍 3 条、QueryBucket=0；删除后 AWS/OSS/DDB/index/查询均无该文件
+- FC 依赖已固定为 Python 3.10 运行时兼容组合；OSS 读取失败重试后返回 502，不再静默伪装成空结果
+- SNS 真实邮箱已确认订阅，FilterPolicy 为 `Sus_scrofa`；`Sus_scrofa_1.JPG` 处理为 `Sus_scrofa:1`，CloudWatch 最近窗口记录发布 2、邮件投递 1、失败 0；一次性 Cognito 用户已删除
+- 视频端到端：10 秒 H.264/1280×960 按 1 fps 处理 10 帧，标签 `Sus_scrofa:10` 及低阈值误报 `Bos_taurus:1`；S3/OSS 视频与 300×225 JPEG 缩略图、DDB/index、FC `Sus_scrofa>=10` 查询和签名 URL 均通过
+- 视频冷启动日志：10 帧、MegaDetector 加载 1 次、SpeciesNet 加载 1 次，126.3 s，`Max Memory Used=2802/3008 MB`，无 OOM/超时
+
+### 6. 本地单元测试 14 项 ✅
+
+- test_aliyun × 5:access-token 契约、FC3 HTTP handler+CORS、签名 URL、OSS 读失败不得静默返回空表、缩略图 OSS host/key 严格校验（本次 5/5 复跑通过）
+- test_p0 × 7:bulk-tags、跨云删除、FilterPolicy、multipart、查询入队/匹配、index 只含 processed
+- test_pipeline × 2:10 帧共用一次 detector 调用并释放分类器、Pillow 缩略图保持宽高比
+- 运行方式:`python3.12 -m unittest discover -s tests`(全量需 boto3/Pillow 可导入；当前全局 Python 缺这两项，本次按范围复跑 `test_aliyun` 5/5)
+
+### 7. Git 与云端前端
+
+- 私有仓库 `xlia416/pacific-bioarchive` 已建立，`main` 已推送并跟踪 `origin/main`
+- 当前 17 个 commit，仍只有 `lxh` 一位作者；其他成员提交仍是 rubric 风险
+- CloudFront HTTPS、完整功能 UI、Cognito Google IdP 已部署；Google 登录按钮与跳转已验证，待真实账号完成一次授权并确认联邦用户记录
+- 08-30 交互修正已部署：全站用户可见文案改为英文；上传显示 checksum/上传百分比/ML 处理状态；预览与查询失败有明确反馈。缩略图反查不再直接渲染用户输入 URL，FC 严格校验 HTTPS OSS host + `thumbs/<sha256>/thumb.jpg`，命中后返回新签名缩略图/原图 URL，错误主机/路径=400、不存在=404。
+
+## 待办(按优先级)
+
+1. **Git 风险(评分硬要求)**：仓库和 remote 已完成，但 17 个 commit 仍全部为单一作者；其他 3 位组员需按分工提交各自模块。
+2. **Google 外部账号最终验收**：用真实 Google 账号完成授权，确认 Cognito `Google_...` 联邦用户及 AWS/阿里云 access-token 调用。
+3. **前端交互验收**：英文 UI、加载/失败状态与严格缩略图反查已部署；需通过页面走完上传、query-by-file、缩略图反查、标签、删除和通知并留证据。
+4. **端到端冒烟**:单图、去重、query-by-file、标签、删除、通知、视频已通过；
+   smoke-test.sh 目前只有 2 项真实断言,其余 8 项待实现
+5. **交付物**:架构图、用户指南、团队报告(AI 使用声明必写)、演示演练
+
+## 部署顺序(已定,勿回退)
+
+ECR 镜像 → AWS 基础设施 → 模型上传 → **阿里云(OSS+FC)** → 前端配置注入+构建上传 → 冒烟测试
+
+> 前端查询面板需要 FC URL;process-media 处理完成即写 OSS,故阿里云必须先于前端与首次上传。
